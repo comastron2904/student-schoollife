@@ -356,6 +356,72 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
   // 심화 탐구 연계 지정 — 자기 자신·자신의 하위 활동은 선택할 수 없다(순환 방지).
   const linkActivity = (id, parentId) => updateActivity(id, "parentId", parentId);
 
+  // ── 파일(PDF/PPT)로 활동 채우기 ──
+  const fillFileRef = useRef(null);      // 숨겨진 <input type="file">
+  const fillTargetRef = useRef(null);    // 어떤 활동에 채울지(activity id)
+  const [fillingId, setFillingId] = useState(null);   // 현재 처리 중인 활동 id
+  const [fillMsg, setFillMsg] = useState("");
+  const [fillErr, setFillErr] = useState({});         // { [activityId]: 오류 메시지 }
+
+  const triggerFileFill = (actId) => {
+    if (fillingId) return; // 동시에 하나만 처리
+    fillTargetRef.current = actId;
+    setFillErr((m) => ({ ...m, [actId]: "" }));
+    fillFileRef.current?.click();
+  };
+
+  async function onFillFileChange(e) {
+    const file = e.target.files?.[0];
+    const actId = fillTargetRef.current;
+    e.target.value = ""; // 같은 파일을 다시 선택해도 change 이벤트가 발생하도록 초기화
+    if (!file || !actId) return;
+
+    const lower = file.name.toLowerCase();
+    if (!lower.endsWith(".pdf") && !lower.endsWith(".pptx")) {
+      setFillErr((m) => ({ ...m, [actId]: "PDF 또는 PPTX 파일만 지원합니다" }));
+      return;
+    }
+
+    setFillingId(actId);
+    setFillErr((m) => ({ ...m, [actId]: "" }));
+    setFillMsg("파일에서 텍스트를 추출하는 중…");
+
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch("/api/extract-file", { method: "POST", body: fd });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || "파일을 읽지 못했습니다");
+
+      const act = (entry?.activities || []).find((a) => a.id === actId);
+      const msgOf = stepMsg("파일 내용을 분석해 활동을 채우는 중…");
+      const result = await callGenerate(
+        {
+          mode: "extract", category: entry.category, subject: entry.subject,
+          fileText: data.text, existingTitle: act?.title || "",
+        },
+        (...args) => setFillMsg(msgOf(...args))
+      );
+
+      // 이미 내용이 있던 칸은 지우지 않고 파일 요약을 이어붙인다. 빈 칸은 그대로 채운다.
+      const mergeField = (cur, added) => {
+        if (!added?.trim()) return cur;
+        return cur?.trim() ? `${cur.trim()}\n\n[파일 요약 — ${file.name}]\n${added.trim()}` : added.trim();
+      };
+      setActivities((arr) => arr.map((a) => a.id !== actId ? a : {
+        ...a,
+        title: a.title?.trim() ? a.title : (result.title || a.title),
+        detail: mergeField(a.detail, result.detail),
+        meaning: mergeField(a.meaning, result.meaning),
+      }));
+    } catch (e) {
+      setFillErr((m) => ({ ...m, [actId]: e?.friendly ? e.message : (e?.message || "처리 중 문제가 발생했습니다") }));
+    } finally {
+      setFillingId(null);
+      setFillMsg("");
+    }
+  }
+
   // 제목을 지정해 활동 추가 — 비어 있는 단일 활동이면 거기에 채우고, 아니면 새로 추가
   const addActivityWithTitle = (title) => setActivities((a) => {
     const onlyEmpty = a.length === 1 && !a[0].title.trim() && !a[0].detail.trim() && !a[0].meaning.trim();
@@ -451,7 +517,10 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
       e.keySource = data?.keySource || "none";
       throw e;
     }
-    return { draft: data.draft || "", notes: data.notes || "" };
+    return {
+      draft: data.draft || "", notes: data.notes || "",
+      title: data.title || "", detail: data.detail || "", meaning: data.meaning || "",
+    };
   }
 
   // 후보 큐를 순차 시도. 실패한 후보는 쿨다운에 등록해 다음 생성 때 건너뛴다.
@@ -1022,6 +1091,7 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
                     <p className="sg-help">
                       <b>한 일 / 관찰</b>은 사실 위주로, <b>의미 / 성장</b>은 드러난 역량이나 변화를 적으면 초안 품질이 좋아집니다.
                       {" "}어떤 활동이 다른 활동에서 이어진 후속 탐구라면 <b>심화 탐구 연계</b>로 지정하세요. AI가 두 활동을 <b>하나의 이어진 탐구 흐름</b>으로 엮어 서술합니다.
+                      {" "}활동지·발표자료가 있다면 <b>PDF·PPT로 채우기</b> 버튼으로 파일을 올려 핵심 내용을 자동으로 채워 넣을 수 있습니다.
                     </p>
                     {hasLinks && (
                       <div className="sg-chain">
@@ -1055,6 +1125,8 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
                         </div>
                       </div>
                     )}
+                    <input ref={fillFileRef} type="file" accept=".pdf,.pptx"
+                           style={{ display: "none" }} onChange={onFillFileChange} />
                     <div className="sg-acts">
                       {actNodes.map(({ act: a, depth, label, parent }) => (
                         <div className={"sg-act" + (depth > 0 ? " sub" : "")} key={a.id}
@@ -1082,6 +1154,15 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
                             </div>
                             <button className="sg-del" onClick={() => removeActivity(a.id)} disabled={entry.activities.length === 1} aria-label="활동 삭제">✕</button>
                           </div>
+                          <div className="sg-fill-row">
+                            <button type="button" className="sg-fill-btn"
+                                    disabled={!!fillingId}
+                                    onClick={() => triggerFileFill(a.id)}>
+                              📎 {fillingId === a.id ? "분석 중…" : "PDF·PPT로 채우기"}
+                            </button>
+                            {fillingId === a.id && <span className="sg-fill-msg">{fillMsg}</span>}
+                          </div>
+                          {fillErr[a.id] && <div className="sg-fill-err">{fillErr[a.id]}</div>}
                           <textarea className="sg-area" rows={2} placeholder="한 일 / 관찰한 내용 — 무엇을, 어떻게 했는지"
                                     value={a.detail} onChange={(e) => updateActivity(a.id, "detail", e.target.value)} />
                           <textarea className="sg-area" rows={2} placeholder="의미 / 성장 — 드러난 역량, 태도, 변화 (선택)"
