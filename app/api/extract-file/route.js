@@ -10,7 +10,11 @@ import pdfParse from "pdf-parse/lib/pdf-parse.js";
 export const maxDuration = 60;
 
 const MAX_TEXT_CHARS = 9000;          // AI 프롬프트에 넣기 적당한 길이로 자름
-const MAX_FILE_BYTES = 15 * 1024 * 1024; // 15MB
+// Vercel 서버리스 함수는 요청 본문 크기가 약 4.5MB로 제한된다(플랫폼 레벨, 설정으로 못 늘림).
+// 이 라우트로의 업로드 자체와, 스캔본을 base64로 실어 /api/generate로 보내는 두 번째 요청 모두 이 한도 안에 들어야 한다.
+const MAX_FILE_BYTES = 4 * 1024 * 1024;    // 4MB — 이 라우트로 올릴 수 있는 원본 파일 상한
+const MAX_VISION_BYTES = 2.5 * 1024 * 1024; // 2.5MB — 스캔본을 이미지로 AI에 보낼 때의 상한(base64 변환 시 약 1.37배로 커짐)
+const MIN_TEXT_LEN = 30; // 이보다 텍스트가 적게 뽑히면 스캔본(이미지)일 가능성이 높다고 판단
 
 function truncate(text) {
   const t = (text || "").replace(/\u0000/g, "").trim();
@@ -62,7 +66,7 @@ export async function POST(request) {
     return NextResponse.json({ error: "파일이 없습니다" }, { status: 400 });
   }
   if (file.size > MAX_FILE_BYTES) {
-    return NextResponse.json({ error: "파일이 너무 큽니다 (15MB 이하만 가능)" }, { status: 400 });
+    return NextResponse.json({ error: "파일이 너무 큽니다 (4MB 이하만 가능 — 서버 요청 크기 제한)" }, { status: 400 });
   }
 
   const name = (file.name || "").toLowerCase();
@@ -85,9 +89,26 @@ export async function POST(request) {
     }
 
     const cleaned = rawText.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-    if (!cleaned) {
+
+    if (cleaned.length < MIN_TEXT_LEN) {
+      // 텍스트 레이어가 거의 없다 = 스캔된 이미지 위주의 문서일 가능성이 높다.
+      // PDF는 파일 자체를 AI(Gemini)에 이미지로 넘겨 내용을 읽게 한다(별도 OCR 없이).
+      if (name.endsWith(".pdf")) {
+        if (buf.length > MAX_VISION_BYTES) {
+          return NextResponse.json(
+            { error: "텍스트가 없는(스캔된) PDF로 보이는데, 이미지 인식으로 처리하기엔 파일이 너무 큽니다. 2.5MB 이하 파일로 다시 시도하거나, 페이지를 나눠 올려 주세요." },
+            { status: 400 }
+          );
+        }
+        return NextResponse.json({
+          scanned: true,
+          fileBase64: buf.toString("base64"),
+          mimeType: "application/pdf",
+          fileName: file.name,
+        });
+      }
       return NextResponse.json(
-        { error: "파일에서 텍스트를 찾지 못했습니다. 이미지 위주의 자료일 수 있어요." },
+        { error: "파일에서 텍스트를 찾지 못했습니다. 이미지 위주의 자료일 수 있어요. (PPT는 이미지 인식을 지원하지 않습니다)" },
         { status: 400 }
       );
     }
