@@ -394,13 +394,22 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
       if (!res.ok) throw new Error(data?.error || "파일을 읽지 못했습니다");
 
       const act = (entry?.activities || []).find((a) => a.id === actId);
-      const msgOf = stepMsg("파일 내용을 분석해 활동을 채우는 중…");
+      const isScanned = !!data.scanned;
+      const payload = isScanned
+        ? {
+            mode: "extract", category: entry.category, subject: entry.subject,
+            existingTitle: act?.title || "", fileBase64: data.fileBase64, fileMime: data.mimeType,
+          }
+        : {
+            mode: "extract", category: entry.category, subject: entry.subject,
+            existingTitle: act?.title || "", fileText: data.text,
+          };
+      const baseMsg = isScanned ? "스캔 문서를 이미지로 읽는 중… (Gemini)" : "파일 내용을 분석해 활동을 채우는 중…";
+      const msgOf = stepMsg(baseMsg);
       const result = await callGenerate(
-        {
-          mode: "extract", category: entry.category, subject: entry.subject,
-          fileText: data.text, existingTitle: act?.title || "",
-        },
-        (...args) => setFillMsg(msgOf(...args))
+        payload,
+        (...args) => setFillMsg(msgOf(...args)),
+        isScanned ? { forceProvider: "gemini" } : {}
       );
 
       // 이미 내용이 있던 칸은 지우지 않고 파일 요약을 이어붙인다. 빈 칸은 그대로 채운다.
@@ -525,11 +534,18 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
 
   // 후보 큐를 순차 시도. 실패한 후보는 쿨다운에 등록해 다음 생성 때 건너뛴다.
   // onStep(cand, i, total, prev) 로 진행 상황(로딩 문구)을 갱신한다.
-  async function callGenerate(payload, onStep) {
-    const cands = buildCandidates(provider, keys);
+  // opts.forceProvider가 있으면 그 제공자 후보만 시도한다(예: 스캔 PDF 이미지 인식은 Gemini만 지원).
+  async function callGenerate(payload, onStep, opts = {}) {
+    const cands = buildCandidates(opts.forceProvider || provider, keys)
+      .filter((c) => !opts.forceProvider || c.provider === opts.forceProvider);
     const { queue, cooled } = orderByCooldown(cands, loadCooldowns());
     if (queue.length === 0) {
-      const e = new Error("등록된 API 키가 없습니다. [API 키]에서 키를 등록해 주세요.");
+      const who = opts.forceProvider ? providerLabel(opts.forceProvider) : null;
+      const e = new Error(
+        who
+          ? `스캔 문서 인식에는 ${who} API 키가 필요합니다. [API 키]에서 ${who} 키를 등록해 주세요.`
+          : "등록된 API 키가 없습니다. [API 키]에서 키를 등록해 주세요."
+      );
       e.friendly = true; openKeyModal(); throw e;
     }
 
