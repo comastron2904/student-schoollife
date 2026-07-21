@@ -107,10 +107,13 @@ function buildExtractSystem(cat, subject) {
 반드시 JSON 형식으로만 출력한다: {"title": "<활동 제목>", "detail": "<한 일/관찰>", "meaning": "<의미/성장, 없으면 빈 문자열>", "notes": "<교사 검토 포인트 1문장, 없으면 빈 문자열>"}`;
 }
 
-function buildExtractUser(fileText, existingTitle) {
+function buildExtractUser(fileText, existingTitle, isVision) {
   const titleHint = existingTitle?.trim()
     ? `\n\n참고로 현재 입력된 활동 제목은 "${existingTitle.trim()}"입니다. 문서 내용과 자연스럽게 어울리면 이 제목을 유지하거나 다듬어도 되고, 더 적절한 제목이 있다면 새로 지어도 됩니다.`
     : "";
+  if (isVision) {
+    return `첨부한 문서는 스캔된 PDF입니다(텍스트가 아니라 이미지). 문서를 직접 읽고 활동 내용을 정리해 주세요.${titleHint}`;
+  }
   return `다음은 업로드된 문서(PDF/PPT)에서 추출한 텍스트입니다.\n\n"""${fileText}"""${titleHint}\n\n위 문서를 바탕으로 활동 내용을 정리해 주세요.`;
 }
 
@@ -196,7 +199,7 @@ async function withRetry(keySource, doFetch, classify) {
   throw aiError(lastCode, keySource); // 재시도 예산 소진
 }
 
-async function callGemini(systemText, userText, apiKey, model) {
+async function callGemini(systemText, userText, apiKey, model, filePart) {
   const userKey = (apiKey || "").trim();
   const key = userKey || process.env.GEMINI_API_KEY;
   const keySource = userKey ? "user" : (process.env.GEMINI_API_KEY ? "server" : "none");
@@ -205,9 +208,13 @@ async function callGemini(systemText, userText, apiKey, model) {
   // thinking 토큰이 maxOutputTokens를 잠식해 응답이 잘리는 문제 방지.
   const thinkingConfig = model.startsWith("gemini-3") ? { thinkingLevel: "low" } : { thinkingBudget: 0 };
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  // filePart가 있으면(스캔 PDF 등) 파일을 이미지 문서로 함께 보내 Gemini가 직접 읽게 한다(별도 OCR 불필요).
+  const parts = filePart?.data
+    ? [{ inlineData: { mimeType: filePart.mimeType || "application/pdf", data: filePart.data } }, { text: userText }]
+    : [{ text: userText }];
   const payload = JSON.stringify({
     systemInstruction: { parts: [{ text: systemText }] },
-    contents: [{ role: "user", parts: [{ text: userText }] }],
+    contents: [{ role: "user", parts }],
     generationConfig: {
       temperature: 0.7,
       maxOutputTokens: MAX_OUTPUT_TOKENS,
@@ -267,9 +274,12 @@ async function callOpenAI(systemText, userText, apiKey, model) {
   return data.choices?.[0]?.message?.content || "";
 }
 
-async function callAI(provider, model, systemText, userText, apiKey) {
-  if (provider === "openai") return callOpenAI(systemText, userText, apiKey, model);
-  return callGemini(systemText, userText, apiKey, model);
+async function callAI(provider, model, systemText, userText, apiKey, filePart) {
+  if (provider === "openai") {
+    if (filePart?.data) throw aiError("UNKNOWN", "none", "OpenAI는 스캔 문서 이미지 인식을 지원하지 않습니다. Gemini API 키로 시도해 주세요.");
+    return callOpenAI(systemText, userText, apiKey, model);
+  }
+  return callGemini(systemText, userText, apiKey, model, filePart);
 }
 
 function parseResult(text) {
@@ -324,7 +334,7 @@ export async function POST(request) {
   const {
     category, subject = "", target = 1500, activities = [], mode = "generate",
     draft = "", instruction = "", apiKey = "", provider: providerRaw = "gemini", model: modelRaw = "",
-    fileText = "", existingTitle = "",
+    fileText = "", existingTitle = "", fileBase64 = "", fileMime = "",
   } = body;
   const cat = catOf(category);
   const provider = normProvider(providerRaw);
@@ -332,15 +342,17 @@ export async function POST(request) {
   // 모델은 화이트리스트 안에서만 허용(임의 모델 주입 방지). 없거나 허용 밖이면 기본 모델.
   const model = isAllowedModel(provider, modelRaw) ? modelRaw : defaultModel(provider);
 
-  if (mode === "extract" && !fileText.trim()) {
+  if (mode === "extract" && !fileText.trim() && !fileBase64.trim()) {
     return NextResponse.json({ error: "파일에서 읽은 내용이 없습니다" }, { status: 400 });
   }
 
   try {
-    let systemText, userText;
+    let systemText, userText, filePart;
     if (mode === "extract") {
+      const isVision = !fileText.trim() && !!fileBase64.trim();
       systemText = buildExtractSystem(cat, subject);
-      userText = buildExtractUser(fileText, existingTitle);
+      userText = buildExtractUser(fileText, existingTitle, isVision);
+      if (isVision) filePart = { data: fileBase64, mimeType: fileMime || "application/pdf" };
     } else {
       systemText = buildSystem(cat, subject, target);
       userText = mode === "refine"
@@ -348,7 +360,7 @@ export async function POST(request) {
         : buildUser(cat, activities);
     }
 
-    const text = await callAI(provider, model, systemText, userText, apiKey);
+    const text = await callAI(provider, model, systemText, userText, apiKey, filePart);
     const parsed = mode === "extract" ? parseExtractResult(text) : parseResult(text);
     return NextResponse.json({ ...parsed, provider, model });
   } catch (e) {
