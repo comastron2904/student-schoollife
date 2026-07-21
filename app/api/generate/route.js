@@ -88,6 +88,32 @@ function buildUser(cat, activities) {
   return `다음은 한 학생의 활동 관찰 기록입니다.\n\n${lines}${chainBlock}\n\n위 내용을 종합해 '${cat.label}' 초안을 작성해 주세요.`;
 }
 
+// ── 파일(PDF/PPT) → 활동 내용 자동 채우기(extract 모드) ──
+function buildExtractSystem(cat, subject) {
+  return `당신은 대한민국 고등학교 학교생활기록부(생기부) 작성을 돕는 전문 보조자입니다. 교사가 업로드한 수업·활동 자료(발표자료, 활동지, 보고서 등)에서 추출한 텍스트를 읽고, 그 안에 담긴 학생 활동을 '${cat.label}'${cat.needsSubject && subject ? ` (과목: ${subject})` : ""} 항목의 활동 기록 입력칸에 넣을 수 있는 형태로 정리합니다.
+
+[작성할 항목]
+- title: 활동을 간단히 나타내는 제목 (10~20자 내외, 명사구)
+- detail: 문서에서 확인되는 '한 일 / 관찰' — 무엇을, 어떻게 했는지 구체적으로 (2~4문장, 사실 중심)
+- meaning: 문서에서 드러나는 '의미 / 성장' 요소가 있다면 간단히 (1~2문장). 근거가 부족하면 빈 문자열로 둔다.
+
+[주의]
+- 문서에 없는 내용을 지어내지 않는다. 확인되지 않는 부분은 과감히 생략한다.
+- 이 항목들은 이후 AI가 생기부 문장을 생성할 때 참고할 '메모'이다. 이 단계에서 명사형 종결체를 억지로 쓸 필요는 없지만, 실제 활동을 육하원칙에 가깝게 구체적으로 적는다.
+- 대학명·기관명·강사 등 특정 인물 실명·수상명·점수 등 생기부 기재 금지 대상은 이 메모에서도 가능하면 일반화된 표현으로 바꾸거나 생략한다.
+- 문서 내용이 특정 학생의 활동이 아니라 일반 자료(예: 교사용 강의안 원본)로만 보이더라도, 그 자료로 무엇을 배우고 활동했을지 합리적으로 추정하지 말고 문서에서 확인되는 내용만 담는다.
+- 문서 내용이 활동과 관련이 낮아 보이면 detail에 "문서 내용만으로는 활동을 파악하기 어렵습니다"라고 적고 나머지는 비워 둔다.
+
+반드시 JSON 형식으로만 출력한다: {"title": "<활동 제목>", "detail": "<한 일/관찰>", "meaning": "<의미/성장, 없으면 빈 문자열>", "notes": "<교사 검토 포인트 1문장, 없으면 빈 문자열>"}`;
+}
+
+function buildExtractUser(fileText, existingTitle) {
+  const titleHint = existingTitle?.trim()
+    ? `\n\n참고로 현재 입력된 활동 제목은 "${existingTitle.trim()}"입니다. 문서 내용과 자연스럽게 어울리면 이 제목을 유지하거나 다듬어도 되고, 더 적절한 제목이 있다면 새로 지어도 됩니다.`
+    : "";
+  return `다음은 업로드된 문서(PDF/PPT)에서 추출한 텍스트입니다.\n\n"""${fileText}"""${titleHint}\n\n위 문서를 바탕으로 활동 내용을 정리해 주세요.`;
+}
+
 // 구조화된 AI 오류 — code(원인)·keySource(개인/공용 키)·retryAfter(초)를 함께 전달
 function aiError(code, keySource, detail = "", retryAfter = 0) {
   const e = new Error(code);
@@ -274,6 +300,18 @@ function parseResult(text) {
   return { draft: clean, notes: "" };
 }
 
+function parseExtractResult(text) {
+  const clean = (text || "").replace(/```json|```/g, "").trim();
+  try {
+    const o = JSON.parse(clean);
+    return { title: o.title || "", detail: o.detail || "", meaning: o.meaning || "", notes: o.notes || "" };
+  } catch {}
+  // 잘린/깨진 JSON이면 최소한 detail이라도 원문에서 건져 온다.
+  const m = clean.match(/"detail"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  const detail = m ? (() => { try { return JSON.parse('"' + m[1] + '"'); } catch { return m[1]; } })() : clean;
+  return { title: "", detail, meaning: "", notes: "" };
+}
+
 export async function POST(request) {
   // 로그인 사용자만 호출 허용
   const supabase = await createClient();
@@ -286,6 +324,7 @@ export async function POST(request) {
   const {
     category, subject = "", target = 1500, activities = [], mode = "generate",
     draft = "", instruction = "", apiKey = "", provider: providerRaw = "gemini", model: modelRaw = "",
+    fileText = "", existingTitle = "",
   } = body;
   const cat = catOf(category);
   const provider = normProvider(providerRaw);
@@ -293,14 +332,25 @@ export async function POST(request) {
   // 모델은 화이트리스트 안에서만 허용(임의 모델 주입 방지). 없거나 허용 밖이면 기본 모델.
   const model = isAllowedModel(provider, modelRaw) ? modelRaw : defaultModel(provider);
 
+  if (mode === "extract" && !fileText.trim()) {
+    return NextResponse.json({ error: "파일에서 읽은 내용이 없습니다" }, { status: 400 });
+  }
+
   try {
-    const systemText = buildSystem(cat, subject, target);
-    const userText = mode === "refine"
-      ? `다음은 작성된 '${cat.label}' 초안입니다.\n\n"""${draft}"""\n\n[요청] ${instruction}\n같은 JSON 형식으로만 출력해 주세요.`
-      : buildUser(cat, activities);
+    let systemText, userText;
+    if (mode === "extract") {
+      systemText = buildExtractSystem(cat, subject);
+      userText = buildExtractUser(fileText, existingTitle);
+    } else {
+      systemText = buildSystem(cat, subject, target);
+      userText = mode === "refine"
+        ? `다음은 작성된 '${cat.label}' 초안입니다.\n\n"""${draft}"""\n\n[요청] ${instruction}\n같은 JSON 형식으로만 출력해 주세요.`
+        : buildUser(cat, activities);
+    }
 
     const text = await callAI(provider, model, systemText, userText, apiKey);
-    return NextResponse.json({ ...parseResult(text), provider, model });
+    const parsed = mode === "extract" ? parseExtractResult(text) : parseResult(text);
+    return NextResponse.json({ ...parsed, provider, model });
   } catch (e) {
     const code = e?.code || "UNKNOWN";
     const keySource = e?.keySource || "none"; // user = 본인 키, server = 배포 공용 키
