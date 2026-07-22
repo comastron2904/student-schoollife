@@ -370,6 +370,82 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
     fillFileRef.current?.click();
   };
 
+  const FILE_UPLOAD_LIMIT = 4 * 1024 * 1024; // 서버(/api/extract-file) 업로드 상한과 동일(Vercel 요청 크기 제한)
+  const MAX_EXTRACT_TEXT = 9000;
+
+  // pptx는 zip 안의 슬라이드 XML을 브라우저에서 직접 읽어 텍스트만 뽑는다.
+  // → 파일 용량과 무관하게 항상 아주 작은 텍스트만 서버로 보내므로 업로드 용량 제한에 걸리지 않는다.
+  async function extractPptxTextClient(file) {
+    const { default: JSZip } = await import("jszip");
+    const buf = await file.arrayBuffer();
+    const zip = await JSZip.loadAsync(buf);
+    const slideFiles = Object.keys(zip.files)
+      .filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n))
+      .sort((a, b) => {
+        const na = parseInt(a.match(/slide(\d+)\.xml/)[1], 10);
+        const nb = parseInt(b.match(/slide(\d+)\.xml/)[1], 10);
+        return na - nb;
+      });
+    const unescapeXml = (s) => s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+    const out = [];
+    for (let i = 0; i < slideFiles.length; i++) {
+      const xml = await zip.files[slideFiles[i]].async("text");
+      const texts = [...xml.matchAll(/<a:t>([^<]*)<\/a:t>/g)].map((m) => unescapeXml(m[1]));
+      const slideText = texts.join(" ").replace(/\s+/g, " ").trim();
+      if (slideText) out.push(`[슬라이드 ${i + 1}] ${slideText}`);
+    }
+    const text = out.join("\n").trim();
+    return text.length > MAX_EXTRACT_TEXT ? text.slice(0, MAX_EXTRACT_TEXT) : text;
+  }
+
+  // 4MB가 넘는 PDF는 서버 업로드 자체가 막히므로(Vercel 요청 크기 제한),
+  // 브라우저에서 각 페이지를 낮은 해상도 JPEG로 렌더링해 용량을 줄인 뒤 이미지로 보낸다(압축 → Gemini 이미지 인식).
+  const PDF_COMPRESS_PRESETS = [
+    { scale: 1.4, quality: 0.72 },
+    { scale: 1.1, quality: 0.55 },
+    { scale: 0.85, quality: 0.4 },
+    { scale: 0.65, quality: 0.32 },
+  ];
+  const PDF_COMPRESS_TARGET_BYTES = 2.5 * 1024 * 1024; // 원본 이미지 바이트 합 목표치(base64 변환 후에도 서버 한도 안에 들도록 여유를 둠)
+  const PDF_COMPRESS_MAX_PAGES = 20;
+
+  async function compressPdfToImages(file, onProgress) {
+    const pdfjsLib = await import("pdfjs-dist");
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+    const pageCount = Math.min(pdf.numPages, PDF_COMPRESS_MAX_PAGES);
+    const truncated = pdf.numPages > PDF_COMPRESS_MAX_PAGES;
+
+    for (let p = 0; p < PDF_COMPRESS_PRESETS.length; p++) {
+      const preset = PDF_COMPRESS_PRESETS[p];
+      const isLast = p === PDF_COMPRESS_PRESETS.length - 1;
+      onProgress?.(`파일이 커서 페이지를 압축하는 중… (${p + 1}/${PDF_COMPRESS_PRESETS.length}차 시도)`);
+
+      const images = [];
+      let totalBytes = 0;
+      for (let i = 1; i <= pageCount; i++) {
+        const page = await pdf.getPage(i);
+        const viewport = page.getViewport({ scale: preset.scale });
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(viewport.width));
+        canvas.height = Math.max(1, Math.round(viewport.height));
+        const ctx = canvas.getContext("2d");
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        const dataUrl = canvas.toDataURL("image/jpeg", preset.quality);
+        const base64 = dataUrl.split(",")[1] || "";
+        totalBytes += base64.length * 0.75; // base64 → 원본 바이트 근사치
+        images.push({ data: base64, mimeType: "image/jpeg" });
+      }
+
+      if (totalBytes <= PDF_COMPRESS_TARGET_BYTES || isLast) {
+        return { images, truncated, pageCount, totalPages: pdf.numPages };
+      }
+    }
+  }
+
   async function onFillFileChange(e) {
     const file = e.target.files?.[0];
     const actId = fillTargetRef.current;
@@ -377,40 +453,55 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
     if (!file || !actId) return;
 
     const lower = file.name.toLowerCase();
-    if (!lower.endsWith(".pdf") && !lower.endsWith(".pptx")) {
+    const isPdf = lower.endsWith(".pdf");
+    const isPptx = lower.endsWith(".pptx");
+    if (!isPdf && !isPptx) {
       setFillErr((m) => ({ ...m, [actId]: "PDF 또는 PPTX 파일만 지원합니다" }));
       return;
     }
 
     setFillingId(actId);
     setFillErr((m) => ({ ...m, [actId]: "" }));
-    setFillMsg("파일에서 텍스트를 추출하는 중…");
+    setFillMsg("파일을 확인하는 중…");
 
     try {
-      const fd = new FormData();
-      fd.append("file", file);
-      const res = await fetch("/api/extract-file", { method: "POST", body: fd });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.error || "파일을 읽지 못했습니다");
-
       const act = (entry?.activities || []).find((a) => a.id === actId);
-      const isScanned = !!data.scanned;
-      const payload = isScanned
-        ? {
-            mode: "extract", category: entry.category, subject: entry.subject,
-            existingTitle: act?.title || "", fileBase64: data.fileBase64, fileMime: data.mimeType,
-          }
-        : {
-            mode: "extract", category: entry.category, subject: entry.subject,
-            existingTitle: act?.title || "", fileText: data.text,
-          };
-      const baseMsg = isScanned ? "스캔 문서를 이미지로 읽는 중… (Gemini)" : "파일 내용을 분석해 활동을 채우는 중…";
+      let payload;
+      let genOpts = {};
+
+      if (isPptx) {
+        // pptx는 항상 브라우저에서 텍스트만 뽑아 보낸다 — 원본 용량과 무관하게 업로드 제한에 걸리지 않는다.
+        setFillMsg("PPT에서 텍스트를 추출하는 중…");
+        const text = await extractPptxTextClient(file);
+        if (!text) throw Object.assign(new Error("PPT에서 텍스트를 찾지 못했습니다. 이미지 위주의 자료일 수 있어요."), { friendly: true });
+        payload = { mode: "extract", category: entry.category, subject: entry.subject, existingTitle: act?.title || "", fileText: text };
+      } else if (file.size <= FILE_UPLOAD_LIMIT) {
+        // 4MB 이하 PDF — 기존 방식대로 서버에 업로드해 텍스트 추출(스캔본이면 서버가 자동으로 비전 모드로 응답).
+        setFillMsg("파일에서 텍스트를 추출하는 중…");
+        const fd = new FormData();
+        fd.append("file", file);
+        const res = await fetch("/api/extract-file", { method: "POST", body: fd });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data?.error || "파일을 읽지 못했습니다");
+
+        payload = data.scanned
+          ? { mode: "extract", category: entry.category, subject: entry.subject, existingTitle: act?.title || "", fileBase64: data.fileBase64, fileMime: data.mimeType }
+          : { mode: "extract", category: entry.category, subject: entry.subject, existingTitle: act?.title || "", fileText: data.text };
+        if (data.scanned) genOpts = { forceProvider: "gemini" };
+      } else {
+        // 4MB 초과 PDF — 서버 업로드 자체가 막히므로, 브라우저에서 페이지를 압축 이미지로 만들어 보낸다.
+        const { images, truncated, pageCount, totalPages } = await compressPdfToImages(file, setFillMsg);
+        if (!images?.length) throw new Error("PDF 페이지를 읽지 못했습니다");
+        if (truncated) {
+          setFillErr((m) => ({ ...m, [actId]: `페이지가 많아 앞 ${pageCount}장(전체 ${totalPages}장)만 분석했어요.` }));
+        }
+        payload = { mode: "extract", category: entry.category, subject: entry.subject, existingTitle: act?.title || "", fileImages: images };
+        genOpts = { forceProvider: "gemini" };
+      }
+
+      const baseMsg = genOpts.forceProvider ? "압축된 페이지를 Gemini로 분석하는 중…" : "파일 내용을 분석해 활동을 채우는 중…";
       const msgOf = stepMsg(baseMsg);
-      const result = await callGenerate(
-        payload,
-        (...args) => setFillMsg(msgOf(...args)),
-        isScanned ? { forceProvider: "gemini" } : {}
-      );
+      const result = await callGenerate(payload, (...args) => setFillMsg(msgOf(...args)), genOpts);
 
       // 이미 내용이 있던 칸은 지우지 않고 파일 요약을 이어붙인다. 빈 칸은 그대로 채운다.
       const mergeField = (cur, added) => {
