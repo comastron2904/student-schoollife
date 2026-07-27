@@ -110,10 +110,10 @@ function buildExtractSystem(cat, subject) {
 - 문서 내용이 활동과 관련이 낮아 보이면 detail에 "문서 내용만으로는 활동을 파악하기 어렵습니다"라고 적고 나머지는 비워 둔다.
 
 [영단어 후처리 — 마지막 점검]
-- title/detail/meaning 작성을 마친 뒤, 그 문장들 안에 알파벳으로 쓰인 영단어나 영문 약어가 남아 있는지 다시 확인한다.
-- 남아 있다면 문장에 자연스럽게 어울리는 같은 의미의 한국어 단어로 바꿔서 title/detail/meaning에 최종 반영한다(예: workshop→워크숍, feedback→피드백처럼 이미 굳어진 외래어 표기가 아니라, 뜻이 통하는 순 한국어·한자어 표현으로).
+- 이 단계는 title/detail/meaning으로 '이미 작성을 마친 문장'에만 적용한다. 원본 문서(PDF/PPT)에 있었지만 최종 문장에 쓰이지 않고 생략된 단어는 대상이 아니다.
+- 방금 작성한 title/detail/meaning 문장을 다시 읽으며, 그 문장 안에 실제로 남아 있는 영단어·영문 약어만 자연스러운 같은 의미의 한국어 단어로 바꿔 title/detail/meaning에 최종 반영한다(예: workshop→워크숍, feedback→피드백처럼 이미 굳어진 외래어 표기가 아니라, 뜻이 통하는 순 한국어·한자어 표현으로).
 - 다만 다음은 바꾸지 않고 그대로 둔다: 프로그래밍 언어·소프트웨어·도구 이름(Python, Excel 등) 같은 고유 명칭, 한국어로 바꾸면 의미가 달라지거나 어색해지는 전문 약어(DNA, AI 등 이미 한국어 문장에서 보편적으로 그대로 쓰이는 표기).
-- 바꾼 단어가 있으면 빠짐없이 replacements 배열에 담아 어떤 단어를 무엇으로 바꿨는지 알린다. 바꾼 것이 없으면 빈 배열로 둔다.
+- replacements 배열에는 위 기준으로 '방금 작성한 title/detail/meaning 문장 안에서 실제로 바꾼 단어'만 담는다. 원본 문서에만 등장하고 최종 문장에는 쓰이지 않은 단어, 혹은 바꾸지 않기로 한 단어는 절대 포함하지 않는다. 바꾼 것이 없으면 빈 배열로 둔다.
 
 반드시 JSON 형식으로만 출력한다: {"title": "<활동 제목>", "detail": "<한 일/관찰, 명사형 종결체>", "meaning": "<의미/성장, 명사형 종결체, 없으면 빈 문자열>", "notes": "<교사 검토 포인트나 제외·일반화한 내용 1문장, 없으면 빈 문자열>", "replacements": [{"from": "<원래 영단어>", "to": "<바뀐 한국어 단어>"}]}`;
 }
@@ -393,6 +393,12 @@ export async function POST(request) {
 
     const text = await callAI(provider, model, systemText, userText, apiKey, fileParts);
     const parsed = mode === "extract" ? parseExtractResult(text) : parseResult(text);
+    if (mode === "extract" && parsed.replacements?.length) {
+      // 모델이 원본 문서에만 있던 단어까지 replacements에 끼워 넣는 경우가 있어,
+      // 실제 최종 title/detail/meaning에 반영된 것만 남기도록 서버에서 한 번 더 거른다.
+      const finalText = `${parsed.title}\n${parsed.detail}\n${parsed.meaning}`;
+      parsed.replacements = parsed.replacements.filter((r) => finalText.includes(r.to));
+    }
     return NextResponse.json({ ...parsed, provider, model });
   } catch (e) {
     const code = e?.code || "UNKNOWN";
