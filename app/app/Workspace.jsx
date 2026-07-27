@@ -362,6 +362,7 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
   const [fillingId, setFillingId] = useState(null);   // 현재 처리 중인 활동 id
   const [fillMsg, setFillMsg] = useState("");
   const [fillErr, setFillErr] = useState({});         // { [activityId]: 오류 메시지 }
+  const [fillReplacements, setFillReplacements] = useState({}); // { [activityId]: [{from,to}] } — 영단어→한국어 후처리 결과
 
   const triggerFileFill = (actId) => {
     if (fillingId) return; // 동시에 하나만 처리
@@ -462,6 +463,7 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
 
     setFillingId(actId);
     setFillErr((m) => ({ ...m, [actId]: "" }));
+    setFillReplacements((m) => ({ ...m, [actId]: [] }));
     setFillMsg("파일을 확인하는 중…");
 
     try {
@@ -514,6 +516,9 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
         detail: mergeField(a.detail, result.detail),
         meaning: mergeField(a.meaning, result.meaning),
       }));
+      if (result.replacements?.length) {
+        setFillReplacements((m) => ({ ...m, [actId]: result.replacements }));
+      }
     } catch (e) {
       setFillErr((m) => ({ ...m, [actId]: e?.friendly ? e.message : (e?.message || "처리 중 문제가 발생했습니다") }));
     } finally {
@@ -620,6 +625,7 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
     return {
       draft: data.draft || "", notes: data.notes || "",
       title: data.title || "", detail: data.detail || "", meaning: data.meaning || "",
+      replacements: Array.isArray(data.replacements) ? data.replacements : [],
     };
   }
 
@@ -1270,6 +1276,17 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
                             {fillingId === a.id && <span className="sg-fill-msg">{fillMsg}</span>}
                           </div>
                           {fillErr[a.id] && <div className="sg-fill-err">{fillErr[a.id]}</div>}
+                          {!!fillReplacements[a.id]?.length && (
+                            <div className="sg-fill-note">
+                              <span className="sg-fill-note-label">영단어 변환</span>
+                              {fillReplacements[a.id].map((r, i) => (
+                                <span key={i} className="sg-fill-note-chip">{r.from} → {r.to}</span>
+                              ))}
+                              <button type="button" className="sg-fill-note-close"
+                                      onClick={() => setFillReplacements((m) => ({ ...m, [a.id]: [] }))}
+                                      aria-label="닫기">✕</button>
+                            </div>
+                          )}
                           <textarea className="sg-area" rows={2} placeholder="한 일 / 관찰한 내용 — 무엇을, 어떻게 했는지"
                                     value={a.detail} onChange={(e) => updateActivity(a.id, "detail", e.target.value)} />
                           <textarea className="sg-area" rows={2} placeholder="의미 / 성장 — 드러난 역량, 태도, 변화 (선택)"
