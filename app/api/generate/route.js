@@ -109,7 +109,13 @@ function buildExtractSystem(cat, subject) {
 - 문서 내용이 특정 학생의 활동이 아니라 일반 자료(예: 교사용 강의안 원본)로만 보이더라도, 그 자료로 무엇을 배우고 활동했을지 합리적으로 추정하지 말고 문서에서 확인되는 내용만 담는다.
 - 문서 내용이 활동과 관련이 낮아 보이면 detail에 "문서 내용만으로는 활동을 파악하기 어렵습니다"라고 적고 나머지는 비워 둔다.
 
-반드시 JSON 형식으로만 출력한다: {"title": "<활동 제목>", "detail": "<한 일/관찰, 명사형 종결체>", "meaning": "<의미/성장, 명사형 종결체, 없으면 빈 문자열>", "notes": "<교사 검토 포인트나 제외·일반화한 내용 1문장, 없으면 빈 문자열>"}`;
+[영단어 후처리 — 마지막 점검]
+- title/detail/meaning 작성을 마친 뒤, 그 문장들 안에 알파벳으로 쓰인 영단어나 영문 약어가 남아 있는지 다시 확인한다.
+- 남아 있다면 문장에 자연스럽게 어울리는 같은 의미의 한국어 단어로 바꿔서 title/detail/meaning에 최종 반영한다(예: workshop→워크숍, feedback→피드백처럼 이미 굳어진 외래어 표기가 아니라, 뜻이 통하는 순 한국어·한자어 표현으로).
+- 다만 다음은 바꾸지 않고 그대로 둔다: 프로그래밍 언어·소프트웨어·도구 이름(Python, Excel 등) 같은 고유 명칭, 한국어로 바꾸면 의미가 달라지거나 어색해지는 전문 약어(DNA, AI 등 이미 한국어 문장에서 보편적으로 그대로 쓰이는 표기).
+- 바꾼 단어가 있으면 빠짐없이 replacements 배열에 담아 어떤 단어를 무엇으로 바꿨는지 알린다. 바꾼 것이 없으면 빈 배열로 둔다.
+
+반드시 JSON 형식으로만 출력한다: {"title": "<활동 제목>", "detail": "<한 일/관찰, 명사형 종결체>", "meaning": "<의미/성장, 명사형 종결체, 없으면 빈 문자열>", "notes": "<교사 검토 포인트나 제외·일반화한 내용 1문장, 없으면 빈 문자열>", "replacements": [{"from": "<원래 영단어>", "to": "<바뀐 한국어 단어>"}]}`;
 }
 
 function buildExtractUser(fileText, existingTitle, isVision, imageCount = 1) {
@@ -318,16 +324,27 @@ function parseResult(text) {
   return { draft: clean, notes: "" };
 }
 
+// replacements 배열을 관대하게 정규화 — {from,to} 쌍이 아니거나 값이 비어 있으면 걸러낸다.
+function normReplacements(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .map((r) => ({ from: String(r?.from ?? "").trim(), to: String(r?.to ?? "").trim() }))
+    .filter((r) => r.from && r.to && r.from !== r.to);
+}
+
 function parseExtractResult(text) {
   const clean = (text || "").replace(/```json|```/g, "").trim();
   try {
     const o = JSON.parse(clean);
-    return { title: o.title || "", detail: o.detail || "", meaning: o.meaning || "", notes: o.notes || "" };
+    return {
+      title: o.title || "", detail: o.detail || "", meaning: o.meaning || "", notes: o.notes || "",
+      replacements: normReplacements(o.replacements),
+    };
   } catch {}
   // 잘린/깨진 JSON이면 최소한 detail이라도 원문에서 건져 온다.
   const m = clean.match(/"detail"\s*:\s*"((?:[^"\\]|\\.)*)"/);
   const detail = m ? (() => { try { return JSON.parse('"' + m[1] + '"'); } catch { return m[1]; } })() : clean;
-  return { title: "", detail, meaning: "", notes: "" };
+  return { title: "", detail, meaning: "", notes: "", replacements: [] };
 }
 
 export async function POST(request) {
