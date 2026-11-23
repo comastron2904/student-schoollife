@@ -5,7 +5,7 @@ import { createClient } from "@/lib/supabase/client";
 import {
   CATEGORIES, REFINEMENTS, PRIORITIES, catOf, studentMeta, neisBytes, charCount, uid, newActivity,
   pushHistorySnapshot, MAX_HISTORY, wordDiff, scanForbiddenTerms, activityTree, descendantIds,
-  STUDENT_STATUSES, statusOf, autoStatusOf,
+  STUDENT_STATUSES, statusOf,
 } from "@/lib/categories";
 import {
   PROVIDERS, PROVIDER_KEYS, providerLabel, modelLabel, keyTag, candId, candLabel,
@@ -73,6 +73,24 @@ function groupByClass(students) {
     return gnum(a.grade) - gnum(b.grade) || gnum(a.klass) - gnum(b.klass);
   });
   return arr;
+}
+
+// 작성 내용으로 학생 상태를 자동 판정 ('완료'는 교사가 직접 지정하므로 여기서 나오지 않음)
+//  · 내용(활동·메모)은 있는데 초안이 없는 항목이 하나라도 있으면 → 작업 필요(todo)
+//  · 그런 항목 없이 초안이 하나 이상 있으면 → 검토 필요(review)
+//  · 아무것도 없으면 → 미지정(none)   (내용도 초안도 없는 빈 탭은 제외)
+// ※ 다른 파일 버전과 어긋나도 화면이 멈추지 않도록 이 파일 안에 둔다.
+const hasText = (v) => typeof v === "string" && v.trim() !== "";
+function autoStatusOf(entries) {
+  let anyDraft = false;
+  for (const e of entries || []) {
+    const drafted = hasText(e?.draft);
+    const content = hasText(e?.notes) ||
+      (Array.isArray(e?.activities) && e.activities.some((a) => hasText(a?.title) || hasText(a?.detail) || hasText(a?.meaning)));
+    if (!drafted && content) return "todo";
+    if (drafted) anyDraft = true;
+  }
+  return anyDraft ? "review" : "none";
 }
 
 export default function Workspace({ initialStudents, initialEntries, userEmail, initialRetention, purgedNotice }) {
@@ -334,6 +352,7 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
   useEffect(() => {
     if (autoDisabledRef.current) return;
     const updates = [];
+    try {
     for (const s of students) {
       const auto = autoStatusOf(s.entries);
       const prevAuto = lastAutoRef.current[s.id];
@@ -342,6 +361,11 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
       if (cur === "done" || cur === auto) continue;
       const firstSeen = prevAuto === undefined;
       if (firstSeen ? cur === "none" : prevAuto !== auto) updates.push({ id: s.id, status: auto });
+    }
+    } catch (e) {
+      console.error("[자동 상태] 판정 실패 — 자동 전환을 끕니다:", e);
+      autoDisabledRef.current = true;
+      return;
     }
     if (!updates.length) return;
     setStudents((arr) => arr.map((s) => {
