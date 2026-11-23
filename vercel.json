@@ -1,6 +1,5 @@
 {
   "crons": [
-    { "path": "/api/cron/retention-remind", "schedule": "0 1 * * *" },
     { "path": "/api/cron/retention-delete", "schedule": "0 2 * * *" }
   ]
 }
