@@ -483,3 +483,7 @@ button,input,textarea{font-family:inherit}
 .sg-wipeopt input{margin-top:3px}
 .sg-wipeopt.on{border-color:var(--danger-line);background:var(--danger-soft)}
 .sg-dangerbtn:disabled{opacity:.45;cursor:not-allowed}
+
+/* 초안 화면 '완료로 표시' 버튼 */
+.sg-donebtn{border-color:#2fb573 !important;color:#2fb573 !important}
+.sg-donebtn.on{background:#2fb573 !important;color:#fff !important}
