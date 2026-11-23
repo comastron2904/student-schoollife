@@ -6,6 +6,7 @@ import { createAdminClient } from "@/lib/supabase/admin";
 import { sendEmail, reminderEmailHtml } from "@/lib/email";
 import { REMINDER_DAYS_BEFORE, daysUntil, fmtDate } from "@/lib/retention";
 
+export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 function authorized(request) {
@@ -41,9 +42,13 @@ export async function GET(request) {
         html: reminderEmailHtml({ appUrl, deleteDateText: fmtDate(row.delete_at), daysLeft: Math.max(daysUntil(row.delete_at), 0) }),
       });
 
-      await supabase.from("retention_settings")
+      // delete_at까지 같을 때만 기록 — 크론 실행 중 교사가 연장했다면 연장으로 초기화된
+      // reminder_sent_at을 덮어쓰지 않아야 다음 삭제 예정일 전에 다시 안내 메일을 받을 수 있다.
+      const { error: upErr } = await supabase.from("retention_settings")
         .update({ reminder_sent_at: new Date().toISOString(), status: "reminder_sent" })
-        .eq("owner_id", row.owner_id);
+        .eq("owner_id", row.owner_id)
+        .eq("delete_at", row.delete_at);
+      if (upErr) throw new Error("발송 기록 실패: " + upErr.message);
 
       results.push({ owner_id: row.owner_id, ok: true });
     } catch (e) {
