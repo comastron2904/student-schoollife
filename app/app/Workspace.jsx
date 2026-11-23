@@ -5,7 +5,7 @@ import { createClient } from "@/lib/supabase/client";
 import {
   CATEGORIES, REFINEMENTS, PRIORITIES, catOf, studentMeta, neisBytes, charCount, uid, newActivity,
   pushHistorySnapshot, MAX_HISTORY, wordDiff, scanForbiddenTerms, activityTree, descendantIds,
-  STUDENT_STATUSES, statusOf,
+  STUDENT_STATUSES, statusOf, autoStatusOf,
 } from "@/lib/categories";
 import {
   PROVIDERS, PROVIDER_KEYS, providerLabel, modelLabel, keyTag, candId, candLabel,
@@ -101,7 +101,6 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
   const [batchStatus, setBatchStatus] = useState("todo");   // 대상 상태 필터
   const [batchCount, setBatchCount] = useState(1);           // 처리할 학생 수(사용자 입력)
   const [batchOnlyEmpty, setBatchOnlyEmpty] = useState(true); // 이미 초안이 있는 항목은 건너뛰기
-  const [batchAutoReview, setBatchAutoReview] = useState(true); // 완료 후 상태를 '검토 필요'로 자동 변경
   const [batchRunning, setBatchRunning] = useState(false);
   const [batchProgress, setBatchProgress] = useState(null); // { index, total, name, sub, log:[{id,name,ok,msg}], done }
   const batchCancelRef = useRef(false);
@@ -326,6 +325,43 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
       setError("상태 저장 실패: students 테이블에 status 컬럼이 있는지 확인해 주세요 (SQL: alter table students add column status text default 'none';)");
     }
   }
+  // ── 작성 내용에 따른 상태 자동 전환 ──
+  // 내용만 있고 초안이 없으면 '작업 필요', 초안까지 있으면 '검토 필요'. '완료'는 직접 지정한 것이라 건드리지 않는다.
+  // 작성 상태가 실제로 바뀌었을 때만 적용하므로, 상태 점 메뉴로 직접 고른 상태는 다음 작성 변화 전까지 유지된다.
+  // (처음 화면을 열 때는 아직 상태가 '미지정'인 학생만 채운다 — 이전에 직접 지정한 상태 보존)
+  const lastAutoRef = useRef({});        // 학생 id → 직전에 판정한 자동 상태
+  const autoDisabledRef = useRef(false); // status 컬럼이 없는 배포본이면 자동 전환 중단
+  useEffect(() => {
+    if (autoDisabledRef.current) return;
+    const updates = [];
+    for (const s of students) {
+      const auto = autoStatusOf(s.entries);
+      const prevAuto = lastAutoRef.current[s.id];
+      lastAutoRef.current[s.id] = auto;
+      const cur = s.status || "none";
+      if (cur === "done" || cur === auto) continue;
+      const firstSeen = prevAuto === undefined;
+      if (firstSeen ? cur === "none" : prevAuto !== auto) updates.push({ id: s.id, status: auto });
+    }
+    if (!updates.length) return;
+    setStudents((arr) => arr.map((s) => {
+      const u = updates.find((x) => x.id === s.id);
+      return u && (s.status || "none") !== "done" ? { ...s, status: u.status } : s;
+    }));
+    for (const u of updates) {
+      supabase.from("students").update({ status: u.status }).eq("id", u.id).or("status.is.null,status.neq.done") // 그 사이 다른 기기에서 완료로 바꿨다면 덮어쓰지 않음
+        .then(({ error }) => { if (error) autoDisabledRef.current = true; });
+    }
+  }, [students]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 초안 화면의 [완료로 표시] 버튼 — 다시 누르면 완료를 풀고 작성 내용에 맞는 상태로 되돌린다.
+  function toggleDone(st) {
+    if (!st) return;
+    const next = (st.status || "none") === "done" ? autoStatusOf(st.entries) : "done";
+    lastAutoRef.current[st.id] = autoStatusOf(st.entries);
+    pickStatus(st.id, next);
+  }
+
   useEffect(() => {
     if (!statusMenuId) return;
     const close = () => setStatusMenuId(null);
@@ -861,10 +897,6 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
                : "건너뜀",
         }],
       }));
-      // 생성에 성공했고 아직 '완료'가 아니라면 '검토 필요'로 자동 전환 — 무엇을 검토해야 할지 놓치지 않도록
-      if (ok && batchAutoReview && (s.status || "none") !== "done") {
-        await pickStatus(s.id, "review");
-      }
     }
     setBatchProgress((p) => ({ ...p, done: true }));
     setBatchRunning(false);
@@ -1609,6 +1641,11 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
                       </div>
                       {entry.draft && (
                         <div className="sg-result-actions">
+                          <button className={"sg-copy sg-donebtn" + ((student.status || "none") === "done" ? " on" : "")}
+                                  onClick={() => toggleDone(student)}
+                                  title={(student.status || "none") === "done" ? "누르면 완료 표시를 해제합니다" : "이 학생을 '완료'로 표시"}>
+                            {(student.status || "none") === "done" ? "✓ 완료됨" : "완료로 표시"}
+                          </button>
                           <button className="sg-copy" onClick={snapshotNow} title="현재 초안을 이력에 저장">스냅샷</button>
                           <button className="sg-copy" onClick={() => { setDiffTarget(null); setHistoryOpen(true); }}>
                             이력{entry.history?.length ? ` (${entry.history.length})` : ""}
@@ -2052,10 +2089,6 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
                 <label className="sg-batchcheck">
                   <input type="checkbox" checked={batchOnlyEmpty} onChange={(e) => setBatchOnlyEmpty(e.target.checked)} />
                   이미 초안이 있는 항목은 건너뛰기
-                </label>
-                <label className="sg-batchcheck">
-                  <input type="checkbox" checked={batchAutoReview} onChange={(e) => setBatchAutoReview(e.target.checked)} />
-                  생성 완료 후 학생 상태를 &apos;검토 필요&apos;로 자동 변경
                 </label>
 
                 <div className="sg-batchrow">
