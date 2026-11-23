@@ -121,6 +121,13 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
   const [backupMsg, setBackupMsg] = useState(null);       // { type: "ok" | "err", text }
   const [importPreview, setImportPreview] = useState(null); // { fileName, data: { students, entries } }
   const importFileRef = useRef(null);
+
+  // ── 강제 초기화·삭제 (보관 기간과 무관하게 즉시) ──
+  const [wipeOpen, setWipeOpen] = useState(false);
+  const [wipeMode, setWipeMode] = useState(null);   // null | "content" | "all"
+  const [wipeConfirm, setWipeConfirm] = useState(""); // 확인 문구 입력값
+  const [wipeBusy, setWipeBusy] = useState(false);
+  const [wipeMsg, setWipeMsg] = useState(null);     // { type: "ok" | "err", text }
   const [refineText, setRefineText] = useState("");  // 직접 입력 수정 요청
   const [byteOpen, setByteOpen] = useState(false);   // 바이트 계산기 모달
   const [byteText, setByteText] = useState("");
@@ -973,6 +980,61 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
     }
   }
 
+  // ── 강제 초기화·삭제 ──
+  const WIPE_WORD = { content: "초기화", all: "전체삭제" };
+  function openWipe() {
+    setWipeMode(null); setWipeConfirm(""); setWipeMsg(null); setWipeOpen(true);
+  }
+  // 대기 중인 자동 저장(600ms 디바운스)이 초기화 뒤에 옛 내용을 다시 써 넣지 않도록 모두 취소
+  function cancelPendingSaves() {
+    for (const t of Object.values(saveTimers.current)) clearTimeout(t);
+    saveTimers.current = {};
+  }
+  // Supabase는 조건 없는 UPDATE/DELETE를 막으므로 "id가 있는 모든 행" 조건을 붙인다(RLS로 내 데이터만 대상).
+  const allRows = (q) => q.not("id", "is", null);
+
+  async function runWipe() {
+    if (!wipeMode || wipeBusy || wipeConfirm.trim() !== WIPE_WORD[wipeMode]) return;
+    if (loading || batchRunning) { setWipeMsg({ type: "err", text: "초안 생성이 진행 중이에요. 끝난 뒤 다시 시도해 주세요." }); return; }
+    setWipeBusy(true); setWipeMsg(null);
+    cancelPendingSaves();
+    try {
+      if (wipeMode === "content") {
+        // ① 명단 유지 — 각 항목(영역·과목 탭)은 남기고 활동·초안·메모·이력만 비운다
+        let blank = { activities: [newActivity()], draft: "", notes: "", history: [], updated_at: new Date().toISOString() };
+        for (let tries = 0; ; tries++) {
+          const { error } = await allRows(supabase.from("entries").update(blank));
+          if (!error) break;
+          // 구버전 스키마에 없는 컬럼(예: history)이면 그 컬럼만 빼고 다시 시도
+          const col = /Could not find the '([^']+)' column/.exec(error.message || "")?.[1];
+          if (!col || !(col in blank) || tries > 3) throw new Error("작성 내용 초기화 실패: " + error.message);
+          const { [col]: _drop, ...rest } = blank; blank = rest;
+        }
+        // 작성 진행 상태(작업 필요·완료 등)도 '미지정'으로 — status 컬럼이 없는 배포본이면 조용히 건너뜀
+        const { error: stErr } = await allRows(supabase.from("students").update({ status: "none" }));
+        setStudents((arr) => arr.map((st) => ({
+          ...st, ...(stErr ? {} : { status: "none" }),
+          entries: st.entries.map((e) => ({ ...e, ...blank, activities: blank.activities.map((a) => ({ ...a })) })),
+        })));
+        setWipeMsg({ type: "ok", text: "학생 명단은 그대로 두고 모든 작성 내용을 초기화했어요." });
+      } else {
+        // ② 전체 삭제 — 항목 → 학생 순서로 삭제(외래키 CASCADE 설정 여부와 무관하게 동작)
+        const { error: eErr } = await allRows(supabase.from("entries").delete());
+        if (eErr) throw new Error("항목 삭제 실패: " + eErr.message);
+        const { error: sErr } = await allRows(supabase.from("students").delete());
+        if (sErr) throw new Error("학생 삭제 실패: " + sErr.message);
+        setStudents([]);
+        setActiveSid(null); setActiveEid(null);
+        setWipeMsg({ type: "ok", text: "학생 명단과 작성 내용을 모두 삭제했어요." });
+      }
+      setWipeMode(null); setWipeConfirm("");
+    } catch (e) {
+      setWipeMsg({ type: "err", text: (e?.message || String(e)) + "\n(일부만 처리됐을 수 있어요. 새로고침해서 확인해 주세요.)" });
+    } finally {
+      setWipeBusy(false);
+    }
+  }
+
   // ── 백업 불러오기 ──
   async function onImportFileChange(ev) {
     const file = ev.target.files?.[0];
@@ -1276,6 +1338,7 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
               ⏳ 데이터 보관{retention ? ` D-${Math.max(retentionDaysLeft, 0)}` : ""}
             </button>
             <button className="sg-fbtn" onClick={() => { setBackupMsg(null); setImportPreview(null); setBackupOpen(true); }}>💾 백업·불러오기</button>
+            <button className="sg-fbtn danger" onClick={openWipe}>🗑 초기화·삭제</button>
             <button className="sg-fbtn" onClick={toggleTheme}>{theme === "dark" ? "☀️ 라이트모드" : "🌙 다크모드"}</button>
             {installEvt && <button className="sg-fbtn install" onClick={installApp}>⬇ 앱 설치</button>}
             <button className="sg-fbtn danger" onClick={signOut}>로그아웃</button>
@@ -1766,6 +1829,64 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
               <div className="sg-keymodal-spacer" />
               <button className="sg-ghost" onClick={() => setDelTarget(null)}>취소</button>
               <button className="sg-dangerbtn" onClick={() => { const id = delTarget.id; setDelTarget(null); deleteStudent(id); }}>삭제</button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* ───────────── 강제 초기화·삭제 모달 ───────────── */}
+      {wipeOpen && (
+        <>
+          <div className="sg-overlay" onClick={() => !wipeBusy && setWipeOpen(false)} />
+          <div className="sg-keymodal sg-confirm">
+            <div className="sg-keymodal-title">데이터 초기화 · 삭제</div>
+            <p className="sg-keymodal-desc">
+              보관 기간과 관계없이 <b>지금 바로</b> 처리되며 <b>되돌릴 수 없습니다.</b> 필요하면 먼저 백업 파일을 받아 두세요.
+            </p>
+            <button className="sg-ghost" style={{ marginBottom: 14 }} disabled={wipeBusy}
+                    onClick={() => { setWipeOpen(false); setBackupMsg(null); setImportPreview(null); setBackupOpen(true); }}>
+              💾 먼저 백업 받기
+            </button>
+
+            <div className="sg-wipeopts">
+              <label className={"sg-wipeopt" + (wipeMode === "content" ? " on" : "")}>
+                <input type="radio" name="wipe" checked={wipeMode === "content"} disabled={wipeBusy}
+                       onChange={() => { setWipeMode("content"); setWipeConfirm(""); setWipeMsg(null); }} />
+                <span>
+                  <b>① 작성 내용만 초기화</b>
+                  <span className="sg-retstatus-sub">학생 명단(이름·학년·반·번호)과 영역·과목 탭은 그대로 두고, 활동·초안·메모·이력과 학생 상태 표시만 비웁니다.</span>
+                </span>
+              </label>
+              <label className={"sg-wipeopt" + (wipeMode === "all" ? " on" : "")}>
+                <input type="radio" name="wipe" checked={wipeMode === "all"} disabled={wipeBusy}
+                       onChange={() => { setWipeMode("all"); setWipeConfirm(""); setWipeMsg(null); }} />
+                <span>
+                  <b>② 명단까지 모두 삭제</b>
+                  <span className="sg-retstatus-sub">학생 {students.length}명과 작성한 모든 항목·초안을 완전히 삭제합니다.</span>
+                </span>
+              </label>
+            </div>
+
+            {wipeMode && (
+              <div className="sg-batchrow" style={{ marginTop: 12 }}>
+                <span className="sg-batchrow-label">확인을 위해 <b>{WIPE_WORD[wipeMode]}</b> 입력</span>
+                <input className="sg-input" value={wipeConfirm} disabled={wipeBusy} style={{ maxWidth: 150 }}
+                       placeholder={WIPE_WORD[wipeMode]} onChange={(e) => setWipeConfirm(e.target.value)}
+                       onKeyDown={(e) => { if (e.key === "Enter") runWipe(); }} />
+              </div>
+            )}
+
+            {wipeMsg && (
+              <div className={wipeMsg.type === "err" ? "sg-error" : "sg-okmsg"} style={{ margin: "12px 0 0" }}>{wipeMsg.text}</div>
+            )}
+
+            <div className="sg-keymodal-row" style={{ marginTop: 14 }}>
+              <div className="sg-keymodal-spacer" />
+              <button className="sg-ghost" onClick={() => setWipeOpen(false)} disabled={wipeBusy}>닫기</button>
+              <button className="sg-dangerbtn" onClick={runWipe}
+                      disabled={!wipeMode || wipeBusy || wipeConfirm.trim() !== WIPE_WORD[wipeMode]}>
+                {wipeBusy ? "처리 중…" : wipeMode === "all" ? "모두 삭제" : wipeMode === "content" ? "초기화" : "선택하세요"}
+              </button>
             </div>
           </div>
         </>
