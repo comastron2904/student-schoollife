@@ -475,3 +475,11 @@ button,input,textarea{font-family:inherit}
 .sg-okmsg{margin:14px 22px;background:var(--accent-soft);border:1px solid var(--accent-line);color:var(--accent-d);font-size:13px;padding:11px 13px;border-radius:10px;white-space:pre-wrap;line-height:1.65}
 .sg-okmsg,.sg-error{position:relative}
 .sg-okmsg .sg-retbanner-x,.sg-error .sg-retbanner-x{position:absolute;top:6px;right:6px}
+
+/* 강제 초기화·삭제 모달 */
+.sg-wipeopts{display:flex;flex-direction:column;gap:8px}
+.sg-wipeopt{display:flex;gap:10px;align-items:flex-start;padding:11px 12px;border:1px solid var(--line);border-radius:11px;cursor:pointer;font-size:13px;color:var(--ink2);line-height:1.5}
+.sg-wipeopt>span{display:flex;flex-direction:column;gap:3px}
+.sg-wipeopt input{margin-top:3px}
+.sg-wipeopt.on{border-color:var(--danger-line);background:var(--danger-soft)}
+.sg-dangerbtn:disabled{opacity:.45;cursor:not-allowed}
