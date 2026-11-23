@@ -12,7 +12,10 @@ import {
   buildCandidates, orderByCooldown, loadCooldowns, markCooldown, clearCooldowns, clearCooldownsForKey,
   loadKeys, saveKeys, waitBeforeRequest, touchRequestAt, sleep, MIN_REQUEST_GAP_MS,
 } from "@/lib/ai";
-import { computeDeleteAt, daysUntil, fmtDate, REMINDER_DAYS_BEFORE } from "@/lib/retention";
+import {
+  computeDeleteAt, computeExtendedDeleteAt, daysUntil, fmtDate, REMINDER_DAYS_BEFORE,
+  fetchAllRows, buildBackupPayload, parseBackup, backupFileName,
+} from "@/lib/retention";
 
 // 남은 쿨다운을 "3시간 12분" / "45초" 처럼 표시
 function untilText(ts) {
@@ -72,7 +75,7 @@ function groupByClass(students) {
   return arr;
 }
 
-export default function Workspace({ initialStudents, initialEntries, userEmail, initialRetention }) {
+export default function Workspace({ initialStudents, initialEntries, userEmail, initialRetention, purgedNotice }) {
   const router = useRouter();
   const supabase = createClient();
 
@@ -109,6 +112,15 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
   const [semesterEndInput, setSemesterEndInput] = useState(initialRetention?.semester_end_at || "");
   const [retentionSaving, setRetentionSaving] = useState(false);
   const [bannerDismissed, setBannerDismissed] = useState(false);
+  const [retentionMsg, setRetentionMsg] = useState(null); // { type: "ok" | "err", text } — 보관 설정 모달·배너 안내
+  const [purgedOpen, setPurgedOpen] = useState(!!purgedNotice); // 접속 시 기간 만료 데이터를 정리했다는 안내
+
+  // ── 백업(JSON 내보내기/불러오기) ──
+  const [backupOpen, setBackupOpen] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupMsg, setBackupMsg] = useState(null);       // { type: "ok" | "err", text }
+  const [importPreview, setImportPreview] = useState(null); // { fileName, data: { students, entries } }
+  const importFileRef = useRef(null);
   const [refineText, setRefineText] = useState("");  // 직접 입력 수정 요청
   const [byteOpen, setByteOpen] = useState(false);   // 바이트 계산기 모달
   const [byteText, setByteText] = useState("");
@@ -862,32 +874,206 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
     setSemesterEndInput(retention?.semester_end_at || "");
     setRetentionOpen(true);
   }
-  // 학기 종료일 저장(신규 지정 또는 재설정) — 저장 시 알림 발송 이력·상태를 초기화한다.
+  // 학기 종료일 저장(신규 지정 또는 재설정) — 삭제 예정일을 새로 계산하고 알림·연장 이력을 초기화한다.
   async function saveSemesterEnd() {
-    if (!semesterEndInput) return;
-    setRetentionSaving(true);
+    if (!semesterEndInput || retentionSaving) return;
+    setRetentionSaving(true); setRetentionMsg(null);
     const delete_at = computeDeleteAt(semesterEndInput);
-    const row = { semester_end_at: semesterEndInput, delete_at, reminder_sent_at: null, status: "active" };
+    const row = { semester_end_at: semesterEndInput, delete_at, reminder_sent_at: null, status: "active", extended_count: 0 };
     const { data, error } = await supabase.from("retention_settings")
       .upsert(row, { onConflict: "owner_id" }).select().single();
     setRetentionSaving(false);
-    if (error) { setError("보관 설정 저장 실패: " + error.message); return; }
+    if (error) { setRetentionMsg({ type: "err", text: "보관 설정 저장 실패: " + error.message }); return; }
     setRetention(data);
     setBannerDismissed(false);
+    setRetentionMsg({ type: "ok", text: `저장했어요. 삭제 예정일은 ${fmtDate(data.delete_at)}입니다.` });
   }
-  // 삭제 예정일을 현재 시점 기준 3개월 뒤로 미루고, 다시 알림을 받을 수 있도록 초기화
+
+  // 삭제 예정일을 3개월 연장 — (현재 삭제 예정일과 지금 중 늦은 날) + 3개월.
+  // 화면에 들고 있던 값이 아니라 DB의 최신 값을 기준으로 계산하고, 그 값이 그대로일 때만 갱신한다.
+  // (다른 탭·기기에서 이미 연장했거나 크론이 상태를 바꾼 경우 덮어쓰거나 두 번 연장되는 혼선 방지)
   async function extendRetention() {
-    if (!retention) return;
-    setRetentionSaving(true);
-    const base = new Date() > new Date(retention.delete_at) ? new Date() : new Date(retention.delete_at);
-    const delete_at = computeDeleteAt(base.toISOString().slice(0, 10));
-    const { data, error } = await supabase.from("retention_settings")
-      .update({ delete_at, reminder_sent_at: null, status: "active", extended_count: (retention.extended_count || 0) + 1 })
-      .eq("owner_id", retention.owner_id).select().single();
-    setRetentionSaving(false);
-    if (error) { setError("연장 실패: " + error.message); return; }
-    setRetention(data);
-    setBannerDismissed(false);
+    if (!retention || retentionSaving) return;
+    setRetentionSaving(true); setRetentionMsg(null);
+    try {
+      let saved = null;
+      for (let attempt = 0; attempt < 3 && !saved; attempt++) {
+        const { data: cur, error: readErr } = await supabase.from("retention_settings").select("*").maybeSingle();
+        if (readErr) throw readErr;
+        const now = new Date();
+        if (!cur) {
+          // 행이 사라졌으면(크론 처리 등) 지금 기준으로 다시 만든다.
+          const delete_at = computeExtendedDeleteAt(null, now);
+          const { data, error } = await supabase.from("retention_settings")
+            .upsert({
+              semester_end_at: retention.semester_end_at || now.toISOString().slice(0, 10),
+              delete_at, reminder_sent_at: null, status: "active",
+              extended_count: (retention.extended_count || 0) + 1,
+            }, { onConflict: "owner_id" }).select().single();
+          if (error) throw error;
+          saved = { prev: null, row: data };
+        } else {
+          const delete_at = computeExtendedDeleteAt(cur.delete_at, now);
+          const { data, error } = await supabase.from("retention_settings")
+            .update({ delete_at, reminder_sent_at: null, status: "active", extended_count: (cur.extended_count || 0) + 1 })
+            .eq("owner_id", cur.owner_id).eq("delete_at", cur.delete_at)
+            .select().maybeSingle();
+          if (error) throw error;
+          if (data) saved = { prev: cur.delete_at, row: data }; // data가 없으면 그 사이 값이 바뀐 것 → 다시 읽고 재시도
+        }
+      }
+      if (!saved) throw new Error("다른 곳에서 동시에 설정이 바뀌었어요. 잠시 후 다시 시도해 주세요.");
+      setRetention(saved.row);
+      setBannerDismissed(false);
+      setRetentionMsg({
+        type: "ok",
+        text: saved.prev
+          ? `연장됐어요: ${fmtDate(saved.prev)} → ${fmtDate(saved.row.delete_at)}`
+          : `연장됐어요. 새 삭제 예정일은 ${fmtDate(saved.row.delete_at)}입니다.`,
+      });
+    } catch (e) {
+      setRetentionMsg({ type: "err", text: "연장 실패: " + (e?.message || e) });
+    } finally {
+      setRetentionSaving(false);
+    }
+  }
+
+  // ── 백업 내보내기 ──
+  // 화면 상태가 아니라 DB에서 전부(1000행 제한 넘어서까지) 다시 읽어 JSON 파일로 저장한다.
+  async function exportBackup() {
+    if (backupBusy) return;
+    setBackupBusy(true); setBackupMsg(null);
+    try {
+      if (saveState === "saving") await sleep(900); // 방금 입력한 내용(600ms 디바운스 저장)이 반영되도록 잠깐 대기
+      const [ss, es] = await Promise.all([fetchAllRows(supabase, "students"), fetchAllRows(supabase, "entries")]);
+      const payload = buildBackupPayload(ss, es);
+      const name = backupFileName();
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+
+      // iOS 홈 화면 앱(PWA)은 a[download]가 동작하지 않아 공유 시트로 저장한다.
+      const isIOSStandalone = /iPad|iPhone|iPod/.test(navigator.userAgent) &&
+        (navigator.standalone || window.matchMedia?.("(display-mode: standalone)").matches);
+      const file = typeof File !== "undefined" ? new File([blob], name, { type: "application/json" }) : null;
+      if (isIOSStandalone && file && navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: name });
+      } else {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = name; a.rel = "noopener"; a.style.display = "none";
+        document.body.appendChild(a); // 일부 브라우저(파이어폭스 등)는 DOM에 붙어 있어야 다운로드됨
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 2000); // 바로 해제하면 다운로드가 취소될 수 있음
+      }
+      setBackupMsg({ type: "ok", text: `학생 ${ss.length}명 · 항목 ${es.length}개를 ${name} 으로 저장했어요.` });
+    } catch (e) {
+      if (e?.name === "AbortError") { setBackupMsg(null); return; } // 공유 시트를 닫은 경우
+      setBackupMsg({ type: "err", text: "백업 파일 만들기 실패: " + (e?.message || e) });
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+
+  // ── 백업 불러오기 ──
+  async function onImportFileChange(ev) {
+    const file = ev.target.files?.[0];
+    ev.target.value = ""; // 같은 파일을 다시 골라도 onChange가 오도록
+    if (!file) return;
+    setBackupMsg(null); setImportPreview(null);
+    try {
+      const data = parseBackup(await file.text());
+      setImportPreview({ fileName: file.name, data });
+    } catch (e) {
+      setBackupMsg({ type: "err", text: e?.message || String(e) });
+    }
+  }
+
+  // DB에 없는 컬럼(예: 구버전 스키마의 status)이 있으면 그 컬럼을 빼고 다시 시도한다.
+  async function writeRows(table, rows, { upsert }) {
+    let data = rows;
+    for (let tries = 0; tries < 6; tries++) {
+      let failed = null;
+      for (let i = 0; i < data.length; i += 200) {
+        const chunk = data.slice(i, i + 200);
+        const q = upsert ? supabase.from(table).upsert(chunk, { onConflict: "id" }) : supabase.from(table).insert(chunk);
+        const { error } = await q;
+        if (error) { failed = { error, written: i }; break; }
+      }
+      if (!failed) return;
+      const col = /Could not find the '([^']+)' column/.exec(failed.error.message || "")?.[1];
+      if (!col || failed.written > 0) { const err = new Error(failed.error.message); err.written = failed.written; throw err; }
+      data = data.map(({ [col]: _drop, ...rest }) => rest);
+    }
+  }
+
+  async function runImport() {
+    if (!importPreview || backupBusy) return;
+    setBackupBusy(true); setBackupMsg(null);
+    const { students: bs, entries: be } = importPreview.data;
+    const clean = ({ owner_id: _o, entries: _e, ...rest }) => rest; // owner_id는 현재 로그인 계정으로 자동 지정됨
+    try {
+      let mode = "restore";
+      const sRows = bs.filter((x) => x.id).map(clean);
+      const sIds = new Set(sRows.map((x) => String(x.id)));
+      const canRestore = sRows.length === bs.length;
+      let restored = false;
+      if (canRestore) {
+        try {
+          // ① 원래 id 그대로 복원 — 같은 학생·항목은 백업 내용으로 덮어쓰고, 없는 것은 새로 추가(중복 생기지 않음)
+          await writeRows("students", sRows, { upsert: true });
+          const eRows = be.filter((e) => e.id && sIds.has(String(e.student_id))).map(clean)
+            .map((e) => ({ ...e, activities: Array.isArray(e.activities) ? e.activities : [] }));
+          await writeRows("entries", eRows, { upsert: true });
+          restored = true;
+        } catch (e) {
+          if (e.written > 0) throw e; // 일부만 들어간 경우엔 사본 추가로 넘어가면 중복되므로 중단
+          // 학생 단계에서 처음부터 막혔으면(다른 계정의 백업 등) ②로 진행
+          if (!/row-level security|duplicate key|violates|invalid input syntax/i.test(e.message)) throw e;
+        }
+      }
+      if (!restored) {
+        // ② 새 id로 사본 추가 — 다른 계정에서 만든 백업도 불러올 수 있음
+        mode = "copy";
+        const idMap = {};
+        for (const st of bs) {
+          const { id: oldId, created_at: _c, ...fields } = clean(st);
+          let row = fields, ins = null;
+          for (let tries = 0; tries < 6; tries++) {
+            ins = await supabase.from("students").insert(row).select("id").single();
+            const col = /Could not find the '([^']+)' column/.exec(ins.error?.message || "")?.[1];
+            if (!col) break;
+            const { [col]: _drop, ...rest } = row; row = rest;
+          }
+          if (ins.error) throw new Error("학생 추가 실패(" + (st.name || "") + "): " + ins.error.message);
+          if (oldId !== undefined) idMap[String(oldId)] = ins.data.id;
+        }
+        const eRows = be.filter((e) => idMap[String(e.student_id)]).map((e) => {
+          const { id: _i, ...rest } = clean(e);
+          return { ...rest, student_id: idMap[String(e.student_id)], activities: Array.isArray(e.activities) ? e.activities : [] };
+        });
+        await writeRows("entries", eRows, { upsert: false });
+      }
+
+      // 불러온 결과를 DB에서 다시 읽어 화면 갱신
+      const [ss, es] = await Promise.all([fetchAllRows(supabase, "students"), fetchAllRows(supabase, "entries")]);
+      ss.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
+      es.sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+      const grouped = groupStudents(ss, es);
+      setStudents(grouped);
+      const keep = grouped.find((x) => x.id === activeSid) || grouped[0];
+      setActiveSid(keep?.id || null);
+      setActiveEid(keep?.entries.find((e) => e.id === activeEid)?.id || keep?.entries[0]?.id || null);
+      setImportPreview(null);
+      setBackupMsg({
+        type: "ok",
+        text: mode === "restore"
+          ? `복원 완료: 학생 ${bs.length}명 · 항목 ${be.length}개 (같은 학생은 백업 내용으로 덮어썼어요)`
+          : `불러오기 완료: 학생 ${bs.length}명을 새로 추가했어요.`,
+      });
+    } catch (e) {
+      setBackupMsg({ type: "err", text: "불러오기 실패: " + (e?.message || e) });
+    } finally {
+      setBackupBusy(false);
+    }
   }
   const retentionDaysLeft = retention ? daysUntil(retention.delete_at) : null;
   const showRetentionBanner = !!retention && retentionDaysLeft <= REMINDER_DAYS_BEFORE && !bannerDismissed;
@@ -1089,6 +1275,7 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
             <button className={"sg-fbtn" + (retention ? " on" : "")} onClick={openRetention}>
               ⏳ 데이터 보관{retention ? ` D-${Math.max(retentionDaysLeft, 0)}` : ""}
             </button>
+            <button className="sg-fbtn" onClick={() => { setBackupMsg(null); setImportPreview(null); setBackupOpen(true); }}>💾 백업·불러오기</button>
             <button className="sg-fbtn" onClick={toggleTheme}>{theme === "dark" ? "☀️ 라이트모드" : "🌙 다크모드"}</button>
             {installEvt && <button className="sg-fbtn install" onClick={installApp}>⬇ 앱 설치</button>}
             <button className="sg-fbtn danger" onClick={signOut}>로그아웃</button>
@@ -1140,12 +1327,29 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
                   ? "학생 데이터가 곧 삭제 처리됩니다."
                   : `학생 데이터가 ${retentionDaysLeft}일 후(${fmtDate(retention.delete_at)}) 삭제될 예정이에요.`}
               </b>
-              <span>삭제 시 그 시점까지의 전체 데이터를 JSON으로 백업해 가입 이메일로 보내드린 뒤 삭제합니다. 계속 사용하시려면 지금 연장해 주세요.</span>
+              <span>삭제되면 복구할 수 없어요. 계속 사용하시려면 연장하시고, 필요하면 지금 백업 파일을 받아 두세요.</span>
             </div>
+            <button className="sg-keybanner-btn" onClick={() => { setBackupMsg(null); setImportPreview(null); setBackupOpen(true); }}>백업 받기</button>
             <button className="sg-keybanner-btn" onClick={extendRetention} disabled={retentionSaving}>
               {retentionSaving ? "연장 중…" : "3개월 연장"}
             </button>
             <button className="sg-retbanner-x" onClick={() => setBannerDismissed(true)} aria-label="닫기">✕</button>
+          </div>
+        )}
+        {!retentionOpen && retentionMsg && (
+          <div className={retentionMsg.type === "err" ? "sg-error" : "sg-okmsg"} style={{ margin: "10px 22px 0" }}>
+            {retentionMsg.text}
+            <button className="sg-retbanner-x" onClick={() => setRetentionMsg(null)} aria-label="닫기">✕</button>
+          </div>
+        )}
+        {purgedOpen && purgedNotice && (
+          <div className="sg-retbanner urgent">
+            <span className="sg-keybanner-icon">🗑️</span>
+            <div className="sg-keybanner-text">
+              <b>보관 기간이 지나 학생 데이터 {purgedNotice.count}명분을 삭제했어요.</b>
+              <span>미리 받아 둔 백업 파일이 있으면 [💾 백업·불러오기]에서 복원할 수 있어요. 다음 학기에 사용하실 때는 [⏳ 데이터 보관]에서 새 학기 종료일을 지정해 주세요.</span>
+            </div>
+            <button className="sg-retbanner-x" onClick={() => setPurgedOpen(false)} aria-label="닫기">✕</button>
           </div>
         )}
 
@@ -1799,13 +2003,13 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
       {/* ───────────── 데이터 보관 설정 모달 ───────────── */}
       {retentionOpen && (
         <>
-          <div className="sg-overlay" onClick={() => setRetentionOpen(false)} />
+          <div className="sg-overlay" onClick={() => { setRetentionOpen(false); setRetentionMsg(null); }} />
           <div className="sg-keymodal">
             <div className="sg-keymodal-title">데이터 보관 설정</div>
             <p className="sg-keymodal-desc">
               학기 종료일을 지정하면 그 날짜로부터 <b>3개월 뒤</b>에 학생 데이터가 자동 삭제됩니다.
-              삭제 <b>7일 전</b> 가입하신 이메일로 안내 메일을 보내드리며, 삭제 시에는 그 시점의 전체 데이터를
-              JSON 백업 파일로 함께 보내드립니다. 안내를 받은 뒤 앱에서 연장하면 3개월 더 미룰 수 있습니다.
+              삭제 <b>7일 전</b>부터 앱 상단에 안내가 표시되며, 연장하면 3개월씩 더 미룰 수 있습니다.
+              삭제된 데이터는 복구할 수 없으니 필요하면 <b>[💾 백업·불러오기]</b>에서 미리 백업 파일을 받아 두세요.
             </p>
 
             <div className="sg-batchrow">
@@ -1814,27 +2018,83 @@ export default function Workspace({ initialStudents, initialEntries, userEmail, 
                      onChange={(e) => setSemesterEndInput(e.target.value)} style={{ maxWidth: 170 }} />
             </div>
 
-            {semesterEndInput && (
+            {semesterEndInput && semesterEndInput !== (retention?.semester_end_at || "") && (
               <p className="sg-keymodal-desc" style={{ margin: "2px 0 14px" }}>
-                → 삭제 예정일: <b>{fmtDate(computeDeleteAt(semesterEndInput))}</b>
+                → 저장하면 삭제 예정일이 <b>{fmtDate(computeDeleteAt(semesterEndInput))}</b>로 새로 설정됩니다.
+                {retention?.extended_count > 0 && <> (지금까지 연장한 기간은 초기화돼요)</>}
               </p>
             )}
 
             {retention && (
               <div className="sg-retstatus">
                 <span>현재 설정된 삭제 예정일 <b>{fmtDate(retention.delete_at)}</b> ({Math.max(retentionDaysLeft, 0)}일 남음)</span>
-                {retention.reminder_sent_at && <span className="sg-retstatus-sub">안내 메일 발송됨 · {fmtDate(retention.reminder_sent_at)}</span>}
                 {retention.extended_count > 0 && <span className="sg-retstatus-sub">지금까지 {retention.extended_count}회 연장함</span>}
-                <button className="sg-ghost" onClick={extendRetention} disabled={retentionSaving}>지금 3개월 연장</button>
+                <span className="sg-retstatus-sub">연장하면 → {fmtDate(computeExtendedDeleteAt(retention.delete_at))}</span>
+                <button className="sg-ghost" onClick={extendRetention} disabled={retentionSaving}>
+                  {retentionSaving ? "처리 중…" : "지금 3개월 연장"}
+                </button>
               </div>
+            )}
+            {retentionMsg && (
+              <div className={retentionMsg.type === "err" ? "sg-error" : "sg-okmsg"} style={{ margin: "0 0 14px" }}>{retentionMsg.text}</div>
             )}
 
             <div className="sg-keymodal-row">
               <div className="sg-keymodal-spacer" />
-              <button className="sg-ghost" onClick={() => setRetentionOpen(false)}>닫기</button>
-              <button className="sg-addbtn" onClick={saveSemesterEnd} disabled={!semesterEndInput || retentionSaving}>
+              <button className="sg-ghost" onClick={() => { setRetentionOpen(false); setRetentionMsg(null); }}>닫기</button>
+              <button className="sg-addbtn" onClick={saveSemesterEnd}
+                      disabled={!semesterEndInput || retentionSaving || semesterEndInput === (retention?.semester_end_at || "")}>
                 {retentionSaving ? "저장 중…" : "저장"}
               </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* ───────────── 백업·불러오기 모달 ───────────── */}
+      {backupOpen && (
+        <>
+          <div className="sg-overlay" onClick={() => !backupBusy && setBackupOpen(false)} />
+          <div className="sg-keymodal">
+            <div className="sg-keymodal-title">백업 · 불러오기</div>
+            <p className="sg-keymodal-desc">
+              모든 학생과 항목(초안·활동·메모·이력 포함)을 <b>JSON 파일</b>로 저장하거나, 저장해 둔 파일로 다시 복원합니다.
+              보관 기간이 끝나면 데이터가 자동 삭제되니, 학기 말에 한 번 내보내 두시길 권장해요.
+            </p>
+
+            <div className="sg-retstatus">
+              <span><b>내보내기</b> — 현재 계정의 전체 데이터를 파일로 저장</span>
+              <button className="sg-ghost" onClick={exportBackup} disabled={backupBusy}>
+                {backupBusy && !importPreview ? "처리 중…" : "⬇ JSON 파일로 내보내기"}
+              </button>
+            </div>
+
+            <div className="sg-retstatus">
+              <span><b>불러오기</b> — 백업 파일을 골라 복원</span>
+              <span className="sg-retstatus-sub">같은 계정의 백업이면 같은 학생은 백업 내용으로 덮어쓰고, 없는 학생은 추가합니다(중복 없음). 다른 계정의 백업은 새 학생으로 추가됩니다.</span>
+              <input ref={importFileRef} type="file" accept=".json,application/json" style={{ display: "none" }} onChange={onImportFileChange} />
+              {!importPreview ? (
+                <button className="sg-ghost" onClick={() => importFileRef.current?.click()} disabled={backupBusy}>⬆ 백업 파일 선택</button>
+              ) : (
+                <>
+                  <span>
+                    「{importPreview.fileName}」 — 학생 <b>{importPreview.data.students.length}명</b> · 항목 <b>{importPreview.data.entries.length}개</b>
+                  </span>
+                  <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+                    <button className="sg-ghost" onClick={() => setImportPreview(null)} disabled={backupBusy}>취소</button>
+                    <button className="sg-addbtn" onClick={runImport} disabled={backupBusy}>{backupBusy ? "불러오는 중…" : "불러오기"}</button>
+                  </div>
+                </>
+              )}
+            </div>
+
+            {backupMsg && (
+              <div className={backupMsg.type === "err" ? "sg-error" : "sg-okmsg"} style={{ margin: "0 0 14px" }}>{backupMsg.text}</div>
+            )}
+
+            <div className="sg-keymodal-row">
+              <div className="sg-keymodal-spacer" />
+              <button className="sg-ghost" onClick={() => setBackupOpen(false)} disabled={backupBusy}>닫기</button>
             </div>
           </div>
         </>
